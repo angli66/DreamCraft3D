@@ -30,17 +30,22 @@ from threestudio.utils.typing import *
 
 
 @dataclass
-class SingleImageDataModuleConfig:
+class MultiImageDataModuleConfig:
     # height and width should be Union[int, List[int]]
     # but OmegaConf does not support Union of containers
+    n_ref_views: int = 2
+    pose_perturb: bool = False
+    images_path: str = ""
+    image_path: str = ""
     height: Any = 96
     width: Any = 96
     resolution_milestones: List[int] = field(default_factory=lambda: [])
+    default_elevation_degs: List[float] = field(default_factory=lambda: [])
     default_elevation_deg: float = 0.0
-    default_azimuth_deg: float = -180.0
+    default_azimuth_degs: List[float] = field(default_factory=lambda: [])
+    default_azimuth_deg: float = 0.0
     default_camera_distance: float = 1.2
     default_fovy_deg: float = 60.0
-    image_path: str = ""
     use_random_camera: bool = True
     random_camera: dict = field(default_factory=dict)
     rays_noise_scale: float = 2e-3
@@ -51,21 +56,27 @@ class SingleImageDataModuleConfig:
     use_mixed_camera_config: bool = False
 
 
-class SingleImageDataBase:
+class MultiImageDataBase:
     def setup(self, cfg, split):
         self.split = split
         self.rank = get_rank()
-        self.cfg: SingleImageDataModuleConfig = cfg
+        self.cfg: MultiImageDataModuleConfig = cfg
 
         if self.cfg.use_random_camera:
             random_camera_cfg = parse_structured(
                 RandomCameraDataModuleConfig, self.cfg.get("random_camera", {})
             )
-            # FIXME: 
+            # FIXME:
             if self.cfg.use_mixed_camera_config:
                 if self.rank % 2 == 0:
-                    random_camera_cfg.camera_distance_range=[self.cfg.default_camera_distance, self.cfg.default_camera_distance]
-                    random_camera_cfg.fovy_range=[self.cfg.default_fovy_deg, self.cfg.default_fovy_deg]
+                    random_camera_cfg.camera_distance_range = [
+                        self.cfg.default_camera_distance,
+                        self.cfg.default_camera_distance,
+                    ]
+                    random_camera_cfg.fovy_range = [
+                        self.cfg.default_fovy_deg,
+                        self.cfg.default_fovy_deg,
+                    ]
                     self.fixed_camera_intrinsic = True
                 else:
                     self.fixed_camera_intrinsic = False
@@ -78,13 +89,13 @@ class SingleImageDataBase:
                     random_camera_cfg, split
                 )
 
-        elevation_deg = torch.FloatTensor([self.cfg.default_elevation_deg])
-        azimuth_deg = torch.FloatTensor([self.cfg.default_azimuth_deg])
+        elevation_deg = torch.FloatTensor(self.cfg.default_elevation_degs)
+        azimuth_deg = torch.FloatTensor(self.cfg.default_azimuth_degs)
         camera_distance = torch.FloatTensor([self.cfg.default_camera_distance])
 
         elevation = elevation_deg * math.pi / 180
         azimuth = azimuth_deg * math.pi / 180
-        camera_position: Float[Tensor, "1 3"] = torch.stack(
+        camera_position: Float[Tensor, "self.cfg.n_ref_views 3"] = torch.stack(
             [
                 camera_distance * torch.cos(elevation) * torch.cos(azimuth),
                 camera_distance * torch.cos(elevation) * torch.sin(azimuth),
@@ -93,18 +104,28 @@ class SingleImageDataBase:
             dim=-1,
         )
 
-        center: Float[Tensor, "1 3"] = torch.zeros_like(camera_position)
+        center: Float[Tensor, "1 3"] = torch.as_tensor([0, 0, 0], dtype=torch.float32)[
+            None
+        ]
+        center: Float[Tensor, "self.cfg.n_ref_views 3"] = center.repeat(
+            self.cfg.n_ref_views, 1
+        )
         up: Float[Tensor, "1 3"] = torch.as_tensor([0, 0, 1], dtype=torch.float32)[None]
+        up: Float[Tensor, "self.cfg.n_ref_views 3"] = up.repeat(self.cfg.n_ref_views, 1)
 
-        light_position: Float[Tensor, "1 3"] = camera_position
-        lookat: Float[Tensor, "1 3"] = F.normalize(center - camera_position, dim=-1)
-        right: Float[Tensor, "1 3"] = F.normalize(torch.cross(lookat, up), dim=-1)
+        light_position: Float[Tensor, "self.cfg.n_ref_views 3"] = camera_position
+        lookat: Float[Tensor, "self.cfg.n_ref_views 3"] = F.normalize(
+            center - camera_position, dim=-1
+        )
+        right: Float[Tensor, "self.cfg.n_ref_views 3"] = F.normalize(
+            torch.cross(lookat, up), dim=-1
+        )
         up = F.normalize(torch.cross(right, lookat), dim=-1)
-        self.c2w: Float[Tensor, "1 3 4"] = torch.cat(
+        self.c2w: Float[Tensor, "self.cfg.n_ref_views 3 4"] = torch.cat(
             [torch.stack([right, up, -lookat], dim=-1), camera_position[:, :, None]],
             dim=-1,
         )
-        self.c2w4x4: Float[Tensor, "B 4 4"] = torch.cat(
+        self.c2w4x4: Float[Tensor, "self.cfg.n_ref_views 4 4"] = torch.cat(
             [self.c2w, torch.zeros_like(self.c2w[:, :1])], dim=1
         )
         self.c2w4x4[:, 3, 3] = 1.0
@@ -152,7 +173,9 @@ class SingleImageDataBase:
     def set_rays(self):
         # get directions by dividing directions_unit_focal by focal length
         directions: Float[Tensor, "1 H W 3"] = self.directions_unit_focal[None]
+        directions = directions.repeat(self.cfg.n_ref_views, 1, 1, 1)
         directions[:, :, :, :2] = directions[:, :, :, :2] / self.focal_length
+        self.directions = directions
 
         rays_o, rays_d = get_rays(
             directions,
@@ -165,73 +188,94 @@ class SingleImageDataBase:
         proj_mtx: Float[Tensor, "4 4"] = get_projection_matrix(
             self.fovy, self.width / self.height, 0.01, 100.0
         )  # FIXME: hard-coded near and far
-        mvp_mtx: Float[Tensor, "4 4"] = get_mvp_matrix(self.c2w, proj_mtx)
+        proj_mtx = proj_mtx.repeat(self.cfg.n_ref_views, 1, 1)
+        mvp_mtx: Float[Tensor, "self.cfg.n_ref_views 4 4"] = get_mvp_matrix(
+            self.c2w, proj_mtx
+        )
 
+        self.proj_mtx = proj_mtx
         self.rays_o, self.rays_d = rays_o, rays_d
         self.mvp_mtx = mvp_mtx
 
     def load_images(self):
-        # load image
-        assert os.path.exists(
-            self.cfg.image_path
-        ), f"Could not find image {self.cfg.image_path}!"
-        rgba = cv2.cvtColor(
-            cv2.imread(self.cfg.image_path, cv2.IMREAD_UNCHANGED), cv2.COLOR_BGRA2RGBA
-        )
-        rgba = (
-            cv2.resize(
-                rgba, (self.width, self.height), interpolation=cv2.INTER_AREA
-            ).astype(np.float32)
-            / 255.0
-        )
-        rgb = rgba[..., :3]
-        self.rgb: Float[Tensor, "1 H W 3"] = (
-            torch.from_numpy(rgb).unsqueeze(0).contiguous().to(self.rank)
-        )
-        self.mask: Float[Tensor, "1 H W 1"] = (
-            torch.from_numpy(rgba[..., 3:] > 0.5).unsqueeze(0).to(self.rank)
-        )
-        print(
-            f"[INFO] single image dataset: load image {self.cfg.image_path} {self.rgb.shape}"
-        )
-
-        # load depth
+        # load images
+        self.rgb = torch.zeros(
+            self.cfg.n_ref_views, self.height, self.width, 3, dtype=torch.float32
+        ).to(self.rank)
+        self.mask = torch.zeros(
+            self.cfg.n_ref_views, self.height, self.width, 1, dtype=torch.bool
+        ).to(self.rank)
         if self.cfg.requires_depth:
-            depth_path = self.cfg.image_path.replace("_rgba.png", "_depth.png")
-            assert os.path.exists(depth_path)
-            depth = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
-            depth = cv2.resize(
-                depth, (self.width, self.height), interpolation=cv2.INTER_AREA
-            )
-            self.depth: Float[Tensor, "1 H W 1"] = (
-                torch.from_numpy(depth.astype(np.float32) / 255.0)
-                .unsqueeze(0)
-                .to(self.rank)
-            )
-            print(
-                f"[INFO] single image dataset: load depth {depth_path} {self.depth.shape}"
-            )
+            self.depth = torch.zeros(
+                self.cfg.n_ref_views, self.height, self.width, dtype=torch.float32
+            ).to(self.rank)
         else:
             self.depth = None
-
-        # load normal
         if self.cfg.requires_normal:
-            normal_path = self.cfg.image_path.replace("_rgba.png", "_normal.png")
-            assert os.path.exists(normal_path)
-            normal = cv2.imread(normal_path, cv2.IMREAD_UNCHANGED)
-            normal = cv2.resize(
-                normal, (self.width, self.height), interpolation=cv2.INTER_AREA
-            )
-            self.normal: Float[Tensor, "1 H W 3"] = (
-                torch.from_numpy(normal.astype(np.float32) / 255.0)
-                .unsqueeze(0)
-                .to(self.rank)
-            )
-            print(
-                f"[INFO] single image dataset: load normal {normal_path} {self.normal.shape}"
-            )
+            self.normal = torch.zeros(
+                self.cfg.n_ref_views, self.height, self.width, 3, dtype=torch.float32
+            ).to(self.rank)
         else:
             self.normal = None
+
+        for i in range(self.cfg.n_ref_views):
+            assert os.path.exists(
+                self.cfg.images_path
+            ), f"Could not find images path {self.cfg.images_path}!"
+
+            image_path = os.path.join(self.cfg.images_path, f"{i}_rgba.png")
+
+            rgba = cv2.cvtColor(
+                cv2.imread(image_path, cv2.IMREAD_UNCHANGED), cv2.COLOR_BGRA2RGBA
+            )
+            rgba = (
+                cv2.resize(
+                    rgba, (self.width, self.height), interpolation=cv2.INTER_AREA
+                ).astype(np.float32)
+                / 255.0
+            )
+            rgb = rgba[..., :3]
+            self.rgb[i] = torch.from_numpy(rgb).unsqueeze(0).contiguous().to(self.rank)
+            self.mask[i] = (
+                torch.from_numpy(rgba[..., 3:] > 0.5).unsqueeze(0).to(self.rank)
+            )
+            print(
+                f"[INFO] multi image dataset: load image {image_path} {self.rgb[i].shape}"
+            )
+
+            # load depth
+            if self.cfg.requires_depth:
+                depth_path = image_path.replace("_rgba.png", "_depth.png")
+                assert os.path.exists(depth_path)
+                depth = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
+                depth = cv2.resize(
+                    depth, (self.width, self.height), interpolation=cv2.INTER_AREA
+                )
+                self.depth[i] = (
+                    torch.from_numpy(depth.astype(np.float32) / 255.0)
+                    .unsqueeze(0)
+                    .to(self.rank)
+                )
+                print(
+                    f"[INFO] multi image dataset: load depth {depth_path} {self.depth[i].shape}"
+                )
+
+            # load normal
+            if self.cfg.requires_normal:
+                normal_path = image_path.replace("_rgba.png", "_normal.png")
+                assert os.path.exists(normal_path)
+                normal = cv2.imread(normal_path, cv2.IMREAD_UNCHANGED)
+                normal = cv2.resize(
+                    normal, (self.width, self.height), interpolation=cv2.INTER_AREA
+                )
+                self.normal[i] = (
+                    torch.from_numpy(normal.astype(np.float32) / 255.0)
+                    .unsqueeze(0)
+                    .to(self.rank)
+                )
+                print(
+                    f"[INFO] multi image dataset: load normal {normal_path} {self.normal[i].shape}"
+                )
 
     def get_all_images(self):
         return self.rgb
@@ -251,30 +295,95 @@ class SingleImageDataBase:
         self.load_images()
 
 
-class SingleImageIterableDataset(IterableDataset, SingleImageDataBase, Updateable):
+class MultiImageIterableDataset(IterableDataset, MultiImageDataBase, Updateable):
     def __init__(self, cfg: Any, split: str) -> None:
         super().__init__()
         self.setup(cfg, split)
 
     def collate(self, batch) -> Dict[str, Any]:
-        batch = {
-            "rays_o": self.rays_o,
-            "rays_d": self.rays_d,
-            "mvp_mtx": self.mvp_mtx,
-            "camera_positions": self.camera_position,
-            "light_positions": self.light_position,
-            "elevation": self.elevation_deg,
-            "azimuth": self.azimuth_deg,
-            "camera_distances": self.camera_distance,
-            "rgb": self.rgb,
-            "ref_depth": self.depth,
-            "ref_normal": self.normal,
-            "mask": self.mask,
-            "height": self.cfg.height,
-            "width": self.cfg.width,
-            "c2w": self.c2w,
-            "c2w4x4": self.c2w4x4,
-        }
+        # Randomly select a value from self.cfg.n_ref_views and use it as the reference view
+        ref_view = torch.randint(self.cfg.n_ref_views, (1,))
+        if not self.cfg.pose_perturb:
+            batch = {
+                "rays_o": self.rays_o[ref_view],
+                "rays_d": self.rays_d[ref_view],
+                "mvp_mtx": self.mvp_mtx[ref_view],
+                "camera_positions": self.camera_position[ref_view],
+                "light_positions": self.light_position[ref_view],
+                "elevation": self.elevation_deg[ref_view],
+                "azimuth": self.azimuth_deg[ref_view],
+                "camera_distances": self.camera_distance,
+                "rgb": self.rgb[ref_view],
+                "ref_depth": self.depth[ref_view] if self.depth is not None else None,
+                "ref_normal": self.normal[ref_view] if self.normal is not None else None,
+                "mask": self.mask[ref_view],
+                "height": self.cfg.height,
+                "width": self.cfg.width,
+                "c2w": self.c2w[ref_view],
+                "c2w4x4": self.c2w4x4[ref_view],
+            }
+        else:
+            # Perturb azimuth, elevation, and camera distance
+            azimuth_deg = self.azimuth_deg[ref_view] + (torch.randn(1) - 0.5) * 20
+            elevation_deg = self.elevation_deg[ref_view] + (torch.randn(1) - 0.5) * 20
+            camera_distance = self.camera_distance + (torch.randn(1) - 0.5) * 0.4
+
+            # Recalculate remaining camera parameters
+            elevation = elevation_deg * math.pi / 180
+            azimuth = azimuth_deg * math.pi / 180
+            camera_position = torch.stack(
+                [
+                    camera_distance * torch.cos(elevation) * torch.cos(azimuth),
+                    camera_distance * torch.cos(elevation) * torch.sin(azimuth),
+                    camera_distance * torch.sin(elevation),
+                ],
+                dim=-1,
+            )
+            center = torch.as_tensor([0, 0, 0], dtype=torch.float32)[None]
+            up = torch.as_tensor([0, 0, 1], dtype=torch.float32)[None]
+            light_position = camera_position
+            lookat = F.normalize(center - camera_position, dim=-1)
+            right = F.normalize(torch.cross(lookat, up), dim=-1)
+            up = F.normalize(torch.cross(right, lookat), dim=-1)
+            c2w = torch.cat(
+                [torch.stack([right, up, -lookat], dim=-1), camera_position[:, :, None]],
+                dim=-1,
+            )
+            c2w4x4 = torch.cat([c2w, torch.zeros_like(c2w[:, :1])], dim=1)
+            c2w4x4[:, 3, 3] = 1.0
+
+            # Get rays
+            rays_o, rays_d = get_rays(
+                self.directions[ref_view],
+                c2w,
+                keepdim=True,
+                noise_scale=self.cfg.rays_noise_scale,
+                normalize=self.cfg.rays_d_normalize,
+            )
+            proj_mtx = get_projection_matrix(
+                self.fovy, self.width / self.height, 0.01, 100.0
+            )
+            mvp_mtx = get_mvp_matrix(c2w, proj_mtx)
+
+            batch = {
+                "rays_o": rays_o,
+                "rays_d": rays_d,
+                "mvp_mtx": mvp_mtx,
+                "camera_positions": camera_position,
+                "light_positions": light_position,
+                "elevation": elevation_deg,
+                "azimuth": azimuth_deg,
+                "camera_distances": camera_distance,
+                "rgb": self.rgb[ref_view],
+                "ref_depth": self.depth[ref_view] if self.depth is not None else None,
+                "ref_normal": self.normal[ref_view] if self.normal is not None else None,
+                "mask": self.mask[ref_view],
+                "height": self.cfg.height,
+                "width": self.cfg.width,
+                "c2w": c2w,
+                "c2w4x4": c2w4x4,
+            }
+
         if self.cfg.use_random_camera:
             batch["random_camera"] = self.random_pose_generator.collate(None)
 
@@ -289,42 +398,68 @@ class SingleImageIterableDataset(IterableDataset, SingleImageDataBase, Updateabl
             yield {}
 
 
-class SingleImageDataset(Dataset, SingleImageDataBase):
+class MultiImageDataset(Dataset, MultiImageDataBase):
     def __init__(self, cfg: Any, split: str) -> None:
         super().__init__()
         self.setup(cfg, split)
 
     def __len__(self):
-        return len(self.random_pose_generator)
+        if self.split == "val":
+            return self.cfg.n_ref_views
+        else:
+            return len(self.random_pose_generator)
 
     def __getitem__(self, index):
-        batch = self.random_pose_generator[index]
-        batch.update(
-            {
-            "height": self.random_pose_generator.cfg.eval_height,
-            "width": self.random_pose_generator.cfg.eval_width,
-            "mvp_mtx_ref": self.mvp_mtx[0],
-            "c2w_ref": self.c2w4x4,
+        if self.split == "val":
+            ref_view = torch.tensor([index])
+            batch = {
+                "index": index,
+                "rays_o": self.rays_o[index],
+                "rays_d": self.rays_d[index],
+                "mvp_mtx": self.mvp_mtx[index],
+                "c2w": self.c2w4x4[index],
+                "camera_positions": self.camera_position[index],
+                "light_positions": self.light_position[index],
+                "elevation": self.elevation_deg[index],
+                "azimuth": self.azimuth_deg[index],
+                "camera_distances": self.camera_distance,
+                "height": self.height,
+                "width": self.width,
+                "fovy": self.fovy,
+                "proj_mtx": self.proj_mtx[index],
+                "mvp_mtx_ref": self.mvp_mtx[ref_view].squeeze(0),
+                "c2w_ref": self.c2w4x4[ref_view],
             }
-        )
+        else:
+            # Randomly select a value from self.cfg.n_ref_views and use it as the reference view
+            ref_view = torch.tensor([0])
+            batch = self.random_pose_generator[index]
+            batch.update(
+                {
+                    "height": self.random_pose_generator.cfg.eval_height,
+                    "width": self.random_pose_generator.cfg.eval_width,
+                    "mvp_mtx_ref": self.mvp_mtx[ref_view].squeeze(0),
+                    "c2w_ref": self.c2w4x4[ref_view],
+                }
+            )
         return batch
 
 
-@register("single-image-datamodule")
-class SingleImageDataModule(pl.LightningDataModule):
-    cfg: SingleImageDataModuleConfig
+@register("multi-image-datamodule")
+class MultiImageDataModule(pl.LightningDataModule):
+    cfg: MultiImageDataModuleConfig
 
     def __init__(self, cfg: Optional[Union[dict, DictConfig]] = None) -> None:
         super().__init__()
-        self.cfg = parse_structured(SingleImageDataModuleConfig, cfg)
+        self.cfg = parse_structured(MultiImageDataModuleConfig, cfg)
 
     def setup(self, stage=None) -> None:
         if stage in [None, "fit"]:
-            self.train_dataset = SingleImageIterableDataset(self.cfg, "train")
+            self.train_dataset = MultiImageIterableDataset(self.cfg, "train")
         if stage in [None, "fit", "validate"]:
-            self.val_dataset = SingleImageDataset(self.cfg, "val")
+            self.val_dataset = MultiImageDataset(self.cfg, "val")
         if stage in [None, "test", "predict"]:
-            self.test_dataset = SingleImageDataset(self.cfg, "test")
+            self.test_dataset = MultiImageDataset(self.cfg, "test")
 
     def prepare_data(self):
         pass

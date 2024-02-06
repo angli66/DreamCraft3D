@@ -1,30 +1,34 @@
-name: "dreamcraft3d-geometry"
+name: "dreamcraft3d-coarse-neus-multiview"
 tag: "${rmspace:${system.prompt_processor.prompt},_}"
-exp_root_dir: "outputs"
+exp_root_dir: "outputs_multiview"
 seed: 0
 
-data_type: "single-image-datamodule"
+data_type: "multi-image-datamodule"
 data:
-  image_path: ./load/images/hamburger_rgba.png
-  height: 1024
-  width: 1024
+  n_ref_views: 7
+  pose_perturb: true
+  images_path: ./load/multiview_images/factory/
+  image_path: ./load/multiview_images/factory/0_rgba.png
+  height: 256
+  width: 256
+  default_elevation_degs: [0.0, 10.0, -10.0, 10.0, -10.0, 10.0, -10.0]
   default_elevation_deg: 0.0
+  default_azimuth_degs: [0.0, 30.0, 90.0, 150.0, -150.0, -90.0, -30.0]
   default_azimuth_deg: 0.0
   default_camera_distance: 3.732
   default_fovy_deg: 30.0
-  requires_depth: ${cmaxgt0orcmaxgt0:${system.loss.lambda_depth},${system.loss.lambda_depth_rel}}
+  requires_depth: false
   requires_normal: ${cmaxgt0:${system.loss.lambda_normal}}
-  use_mixed_camera_config: false
   random_camera:
-    height: 1024
-    width: 1024
+    height: 256
+    width: 256
     batch_size: 1
-    eval_height: 1024
-    eval_width: 1024
+    eval_height: 512
+    eval_width: 512
     eval_batch_size: 1
     elevation_range: [-10, 45]
     azimuth_range: [-180, 180]
-    camera_distance_range: [3.8, 3.8]
+    camera_distance_range: [3.732, 3.732]
     fovy_range: [30.0, 30.0] # Zero123 has fixed fovy
     progressive_until: 0
     camera_perturb: 0.0
@@ -34,31 +38,45 @@ data:
     eval_camera_distance: ${data.default_camera_distance}
     eval_fovy_deg: ${data.default_fovy_deg}
     batch_uniform_azimuth: false
-    n_val_views: 40
+    n_val_views: ${data.n_ref_views}
     n_test_views: 120
 
 system_type: "dreamcraft3d-system"
 system:
-  view_type: "single-view"
-  stage: geometry
-  use_mixed_camera_config: ${data.use_mixed_camera_config}
-  geometry_convert_from: ???
-  geometry_convert_inherit_texture: true
-  geometry_type: "tetrahedra-sdf-grid"
+  view_type: "multi-view"
+  stage: coarse
+  geometry_type: "implicit-sdf"
   geometry:
-    radius: 2.0 # consistent with coarse
-    isosurface_resolution: 128
-    isosurface_deformable_grid: true
+    radius: 2.0
+    normal_type: "finite_difference"
+
+    sdf_bias: sphere
+    sdf_bias_params: 0.5
+
+    # coarse to fine hash grid encoding
+    pos_encoding_config:
+      otype: HashGrid
+      n_levels: 16
+      n_features_per_level: 2
+      log2_hashmap_size: 19
+      base_resolution: 16
+      per_level_scale: 1.447269237440378 # max resolution 4096
+      start_level: 8 # resolution ~200
+      start_step: 2000
+      update_steps: 500
 
   material_type: "no-material"
   material:
-    n_output_dims: 3
+    requires_normal: true
 
   background_type: "solid-color-background"
 
-  renderer_type: "nvdiff-rasterizer"
+  renderer_type: "neus-volume-renderer"
   renderer:
-    context_type: cuda
+    radius: ${system.geometry.radius}
+    num_samples_per_ray: 512
+    cos_anneal_end_steps: ${trainer.max_steps}
+    eval_chunk_size: 8192
 
   prompt_processor_type: "deep-floyd-prompt-processor"
   prompt_processor:
@@ -70,7 +88,7 @@ system:
   guidance:
     pretrained_model_name_or_path: "DeepFloyd/IF-I-XL-v1.0"
     guidance_scale: 20
-    min_step_percent: 0.02
+    min_step_percent: 0.2
     max_step_percent: 0.5
 
   guidance_3d_type: "stable-zero123-guidance"
@@ -82,21 +100,20 @@ system:
     cond_azimuth_deg: ${data.default_azimuth_deg}
     cond_camera_distance: ${data.default_camera_distance}
     guidance_scale: 5.0
-    min_step_percent: 0.2  # (start_iter, start_val, end_val, end_iter)
+    min_step_percent: 0.2
     max_step_percent: 0.5
 
   freq:
     n_ref: 2
     ref_only_steps: 0
-    ref_or_guidance: "accumulate"
+    ref_or_guidance: "alternate"
     no_diff_steps: 0
     guidance_eval: 0
-    n_rgb: 4
 
   loggers:
     wandb:
       enable: true
-      project: "dreamcraft3d-singleview"
+      project: "dreamcraft3d-multiview"
       name: "${name}-${tag}"
 
   loss:
@@ -108,17 +125,28 @@ system:
     lambda_depth: 0.0
     lambda_depth_rel: 0.0
     lambda_normal: 0.0
-    lambda_normal_smooth: 0.
-    lambda_3d_normal_smooth: 0.
-    lambda_normal_consistency: [1000,10.0,1,2000]
-    lambda_laplacian_smoothness: 0.0
+    lambda_normal_smooth: 0.0
+    lambda_3d_normal_smooth: 0.0
+    lambda_orient: 10.0
+    lambda_sparsity: 0.1
+    lambda_opaque: 0.1
+    lambda_clip: 0.0
+    lambda_eikonal: 0.0
 
   optimizer:
     name: Adam
     args:
-      lr: 0.005
       betas: [0.9, 0.99]
       eps: 1.e-15
+    params:
+      geometry.encoding:
+        lr: 0.01
+      geometry.sdf_network:
+        lr: 0.001
+      geometry.feature_network:
+        lr: 0.001
+      renderer:
+        lr: 0.001
 
 trainer:
   max_steps: 5000
@@ -126,8 +154,7 @@ trainer:
   num_sanity_val_steps: 0
   val_check_interval: 200
   enable_progress_bar: true
-  precision: 32
-  strategy: "ddp_find_unused_parameters_true"
+  precision: 16-mixed
 
 checkpoint:
   save_last: true

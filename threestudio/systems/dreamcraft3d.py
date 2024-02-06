@@ -24,6 +24,7 @@ class ImageConditionDreamFusion(BaseLift3DSystem):
     class Config(BaseLift3DSystem.Config):
         # in ['coarse', 'geometry', 'texture'].
         # Note that in the paper we consolidate 'coarse' and 'geometry' into a single phase called 'geometry-sculpting'.
+        view_type: str = "single-view"
         stage: str = "coarse"
         freq: dict = field(default_factory=dict)
         guidance_3d_type: str = ""
@@ -328,6 +329,10 @@ class ImageConditionDreamFusion(BaseLift3DSystem):
                 self.log(f"train/{name}_w", loss_weighted)
                 loss += loss_weighted
 
+            # Calculate PSNR for rgb loss
+            if name == "loss_ref_rgb":
+                self.log(f"train/psnr_ref", 10 * torch.log10(1 / value))
+
         for name, value in self.cfg.loss.items():
             self.log(f"train_params/{name}", self.C(value))
 
@@ -355,6 +360,9 @@ class ImageConditionDreamFusion(BaseLift3DSystem):
                 if (self.guidance.cfg.only_pretrain_step > 0) and (self.global_step % self.guidance.cfg.only_pretrain_step) < (self.guidance.cfg.only_pretrain_step // 5):
                     do_guidance = True
                     do_ref = False
+        elif self.cfg.freq.ref_or_guidance == "ref_only":
+            do_ref = True
+            do_guidance = False
 
         if self.cfg.stage == "geometry":
             render_type = "rgb" if self.true_global_step % self.cfg.freq.n_rgb == 0 else "normal"
@@ -474,12 +482,17 @@ class ImageConditionDreamFusion(BaseLift3DSystem):
         filestem = f"it{self.true_global_step}-val"
 
         try:
+            if self.cfg.view_type == "multi-view":
+                fps = 1
+            elif self.cfg.view_type == "single-view":
+                fps = 30
+
             self.save_img_sequence(
                 filestem,
                 filestem,
                 "(\d+)\.png",
                 save_format="mp4",
-                fps=30,
+                fps=fps,
                 name="validation_epoch_end",
                 step=self.true_global_step,
             )

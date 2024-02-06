@@ -10,9 +10,9 @@ data:
   width: 256
   default_elevation_deg: 0.0
   default_azimuth_deg: 0.0
-  default_camera_distance: 3.8
-  default_fovy_deg: 20.0
-  requires_depth: true
+  default_camera_distance: 3.732
+  default_fovy_deg: 30.0
+  requires_depth: false
   requires_normal: ${cmaxgt0:${system.loss.lambda_normal}}
   random_camera:
     height: 256
@@ -24,7 +24,7 @@ data:
     elevation_range: [-10, 45]
     azimuth_range: [-180, 180]
     camera_distance_range: [3.8, 3.8]
-    fovy_range: [20.0, 20.0] # Zero123 has fixed fovy
+    fovy_range: [30.0, 30.0] # Zero123 has fixed fovy
     progressive_until: 0
     camera_perturb: 0.0
     center_perturb: 0.0
@@ -38,6 +38,7 @@ data:
 
 system_type: "dreamcraft3d-system"
 system:
+  view_type: "single-view"
   stage: coarse
   geometry_type: "implicit-sdf"
   geometry:
@@ -106,8 +107,9 @@ system:
 
   loggers:
     wandb:
-      enable: false
-      project: "threestudio"
+      enable: true
+      project: "dreamcraft3d-singleview"
+      name: "${name}-${tag}"
 
   loss:
     lambda_sd: 0.1
@@ -116,7 +118,7 @@ system:
     lambda_mask: 100.0
     lambda_mask_binary: 0.0
     lambda_depth: 0.0
-    lambda_depth_rel: 0.05
+    lambda_depth_rel: 0.0
     lambda_normal: 0.0
     lambda_normal_smooth: 0.0
     lambda_3d_normal_smooth: 0.0

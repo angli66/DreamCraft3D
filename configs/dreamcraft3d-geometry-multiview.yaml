@@ -1,14 +1,19 @@
-name: "dreamcraft3d-geometry"
+name: "dreamcraft3d-geometry-multiview"
 tag: "${rmspace:${system.prompt_processor.prompt},_}"
-exp_root_dir: "outputs"
+exp_root_dir: "outputs_multiview"
 seed: 0
 
-data_type: "single-image-datamodule"
+data_type: "multi-image-datamodule"
 data:
-  image_path: ./load/images/hamburger_rgba.png
+  n_ref_views: 7
+  pose_perturb: true
+  images_path: ./load/multiview_images/factory/
+  image_path: ./load/multiview_images/factory/0_rgba.png
   height: 1024
   width: 1024
+  default_elevation_degs: [0.0, 10.0, -10.0, 10.0, -10.0, 10.0, -10.0]
   default_elevation_deg: 0.0
+  default_azimuth_degs: [0.0, 30.0, 90.0, 150.0, -150.0, -90.0, -30.0]
   default_azimuth_deg: 0.0
   default_camera_distance: 3.732
   default_fovy_deg: 30.0
@@ -24,7 +29,7 @@ data:
     eval_batch_size: 1
     elevation_range: [-10, 45]
     azimuth_range: [-180, 180]
-    camera_distance_range: [3.8, 3.8]
+    camera_distance_range: [3.732, 3.732]
     fovy_range: [30.0, 30.0] # Zero123 has fixed fovy
     progressive_until: 0
     camera_perturb: 0.0
@@ -34,12 +39,12 @@ data:
     eval_camera_distance: ${data.default_camera_distance}
     eval_fovy_deg: ${data.default_fovy_deg}
     batch_uniform_azimuth: false
-    n_val_views: 40
+    n_val_views: ${data.n_ref_views}
     n_test_views: 120
 
 system_type: "dreamcraft3d-system"
 system:
-  view_type: "single-view"
+  view_type: "multi-view"
   stage: geometry
   use_mixed_camera_config: ${data.use_mixed_camera_config}
   geometry_convert_from: ???
@@ -96,7 +101,7 @@ system:
   loggers:
     wandb:
       enable: true
-      project: "dreamcraft3d-singleview"
+      project: "dreamcraft3d-multiview"
       name: "${name}-${tag}"
 
   loss:
